@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>圆形杆阵动作编辑器</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101522;color:#eff4ff;font:14px system-ui,sans-serif}header{padding:22px 26px;border-bottom:1px solid #293448;display:flex;align-items:center;justify-content:space-between;gap:16px}h1{font-size:22px;margin:0}header span,.muted{color:#a8b8ce}main{display:grid;grid-template-columns:310px 1fr;gap:16px;padding:16px;max-width:1600px;margin:auto}aside,section{border:1px solid #293448;border-radius:15px;background:#182132;padding:16px}h2{font-size:15px;margin:0 0 12px}fieldset{padding:0;border:0;margin:0 0 20px}legend{font-weight:700;margin-bottom:10px}label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:8px 0}input[type=number]{width:95px;background:#101522;border:1px solid #42536e;border-radius:6px;color:inherit;padding:7px}input[type=range]{width:100%;accent-color:#7fe4cf;margin:0}button{background:#25344b;color:inherit;border:1px solid #435572;border-radius:7px;padding:8px 12px;cursor:pointer}button:hover,button[aria-pressed=true]{background:#395875}button:disabled{opacity:.45;cursor:default}.primary{background:#83e6d0;color:#10251f;border-color:#83e6d0;font-weight:700}.primary:hover{background:#abf0e1}.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}.bar strong{margin-right:auto}canvas{width:100%;height:auto;display:block;border-radius:10px;background:#111827;touch-action:none}.timeline{margin:14px 0}.status{min-height:2.5em;color:#ffc38b}output{color:#9ff0dd;font-variant-numeric:tabular-nums}.help{line-height:1.6;margin:6px 0}.preview{align-self:start}@media(max-width:800px){main{grid-template-columns:1fr}.preview{grid-row:1}header{padding:14px}header span{display:none}}
+</style>
+<header><h1>圆形杆阵动作编辑器</h1><span>尺寸排布 · 独立随机升降</span></header>
+<main>
+<aside>
+<fieldset><legend>阵列尺寸</legend>
+<label>外圆直径 mm <input id="outer" type="number" min="1" value="3000"></label>
+<label>柱中心距 mm <input id="pitch" type="number" min="1" value="200"></label>
+<label>圆柱直径 mm <input id="rod" type="number" min="1" value="90"></label>
+<p class="muted help">方格布点，以圆心为原点，仅保留整根柱都在外圆内的位置。</p>
+<p id="error" class="status" role="status"></p></fieldset>
+<fieldset><legend>随机动作</legend>
+<label for="stroke">最大行程 <output id="strokeOut"></output></label><input id="stroke" type="range" min="0" max="400" value="300">
+<label for="rate">触发频率 <output id="rateOut"></output></label><input id="rate" type="range" min="0" max="100" step="1" value="55">
+<label for="cap">同时活动上限 <output id="capOut"></output></label><input id="cap" type="range" min="1" max="100" value="55">
+<p class="muted help">频率随柱数和动作时长调整。实际同时活动根数受上限限制。</p>
+<label for="travel">单程时间 <output id="travelOut"></output></label><input id="travel" type="range" min=".3" max="3" step=".1" value="1">
+<label for="hold">最长停留 <output id="holdOut"></output></label><input id="hold" type="range" min="0" max="4" step=".1" value="1">
+<label for="flicker">灯光闪烁强度 <output id="flickerOut"></output></label><input id="flicker" type="range" min="0" max="100" value="85">
+<label for="manual">手动试动作 <output id="manualOut"></output></label><input id="manual" type="range" min="0" max="300" value="0">
+<p class="muted help">暂停后，在俯视图点选单柱再拖滑杆。未选中时试动整阵。</p>
+</fieldset>
+</aside>
+<section class="preview">
+<div class="bar"><strong><output id="count">0 根</output> <span id="gap" class="muted"></span></strong><button id="perspective" aria-pressed="true">环绕</button><button id="plan" aria-pressed="false">俯视</button><button id="resetView">重置视角</button></div>
+<canvas id="view" width="1200" height="720" aria-label="圆形吊顶杆阵预览"></canvas>
+<p id="viewHelp" class="muted help">拖动画面环绕和俯仰，滚轮缩放。</p>
+<label>播放总时长（秒） <input id="duration" type="number" min="1" max="600" step="any" value="25"></label>
+<label class="timeline" for="time">播放进度 <output id="clock"></output></label><input id="time" type="range" min="0" max="25" step=".01" value="0">
+<div class="bar" style="margin-top:12px"><button class="primary" id="play">播放</button><button id="shuffle">换一组随机</button><button id="record">录制 25 秒视频</button><span id="message" role="status" class="muted"></span></div>
+</section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const value = id => $(id).valueAsNumber;
+const canvas = $('view');
+const ctx = canvas.getContext('2d');
+let duration = value('duration');
+let points = [], actions = [], seed = 5891, time = 0, selected = -1;
+let animationFrame = 0;
+let playing = false, overhead = false, manual = false, recording = false, valid = true;
+let radius = 1500, diameter = 90, last = 0;
+const homeCamera = { yaw: -.55, elevation: -.38, zoom: 1 };
+let camera = {...homeCamera};
+let drag = null;
+
+function layout(outer, pitch, rod) {
+  if (![outer,pitch,rod].every(n => Number.isFinite(n) && n > 0)) throw Error('请输入大于 0 的尺寸。');
+  if (rod > outer || rod > pitch) throw Error('柱径不能大于外圆直径或柱中心距。');
+  const limit = (outer - rod) / 2;
+  const steps = Math.floor(limit / pitch);
+  if (steps > 30) throw Error('阵列过密。请增大中心距，预览支持最多 2,500 根。');
+  const grid = [];
+  for (let y = -steps; y <= steps; y++) {
+    for (let x = -steps; x <= steps; x++) {
+      if (Math.hypot(x*pitch,y*pitch) <= limit + 1e-8) grid.push({x:x*pitch,y:y*pitch});
+    }
+  }
+  if (grid.length > 2500) throw Error('预览支持最多 2,500 根，请增大中心距。');
+  return grid;
+}
+
+function buildActions() {
+  let state = seed;
+  function random() {
+    state = (Math.imul(state,1664525)+1013904223) >>> 0;
+    return state / 4294967296;
+  }
+  actions = points.map(() => []);
+  const finish = points.map(() => 0);
+  const {rate, cap} = activity();
+  if (!rate || !cap) return;
+  const step = 1/30;
+  for (let frame = 0; frame < duration/step; frame++) {
+    const start = frame*step;
+    const attempts = Math.floor(rate*step + random());
+    if (!attempts) continue;
+    const free = [];
+    finish.forEach((end,i) => { if (end <= start) free.push(i); });
+    const available = Math.min(attempts, free.length, cap - (points.length - free.length));
+    for (let i = 0; i < available; i++) {
+      const pick = Math.floor(random()*free.length);
+      const index = free[pick];
+      free[pick] = free[free.length-1];
+      free.pop();
+      const travel = value('travel')*(.7 + random()*.6);
+      const hold = value('hold')*random();
+      const offset = start + random()*step;
+      const end = offset + travel*2 + hold;
+      if (end > duration) continue;
+      actions[index].push({start:offset,end,travel,hold,fraction:.15+random()*.85});
+      finish[index] = end;
+    }
+  }
+}
+
+function activity() {
+  const averageCycle = 2*value('travel') + value('hold')/2;
+  return {
+    rate: 1.6*points.length/averageCycle * value('rate')/100,
+    cap: Math.ceil(points.length * value('cap')/100)
+  };
+}
+
+function updateGeometry() {
+  try {
+    points = layout(value('outer'),value('pitch'),value('rod'));
+    radius = value('outer')/2;
+    diameter = value('rod');
+    valid = true;
+    $('error').textContent = '';
+  } catch (error) {
+    points = [];
+    valid = false;
+    stop();
+    $('error').textContent = error.message;
+  }
+  selected = -1;
+  $('count').textContent = valid ? points.length + ' 根' : '—';
+  $('gap').textContent = valid ? ' · 柱间净距 ' + Number((value('pitch')-diameter).toFixed(2)) + ' mm' : '';
+  $('play').disabled = $('record').disabled = !valid;
+  updateControls();
+}
+function updateControls(rebuild = true) {
+  $('manual').max = value('stroke');
+  const units = {stroke:' mm',travel:' 秒',hold:' 秒',flicker:'%',manual:' mm'};
+  Object.entries(units).forEach(([id,unit]) => $(id+'Out').textContent = value(id)+unit);
+  const {rate, cap} = activity();
+  $('rateOut').textContent = value('rate')+'% · 约 '+Number(rate.toFixed(1))+' 次/秒';
+  $('capOut').textContent = cap+' / '+points.length+' 根';
+  if (rebuild) buildActions();
+  draw();
+}
+function depthAt(index) {
+  if (manual && !playing) return selected < 0 || selected === index ? value('manual') : 0;
+  const action = actions[index].find(a => time >= a.start && time < a.end);
+  if (!action) return 0;
+  const {start,end,travel,fraction} = action;
+  const p = Math.min(1,(time-start)/travel,(end-time)/travel);
+  return value('stroke')*fraction*p*p*(3-2*p);
+}
+function lightAt(index, extension) {
+  const strength = value('flicker')/100;
+  if (time <= 0 || time >= duration) return 0;
+  if (extension <= 0) return 1;
+  const rate = 1.2 + ((index*37)%101)/65;
+  const phase = index * 2.399963;
+  const pulse = .5 + .5*Math.sin(time*rate*2*Math.PI + phase + .65*Math.sin(time*4 + index));
+  const blend = Math.min(1,extension/3);
+  return 1 - strength*blend*(1-pulse**3);
+}
+function projection() {
+  const stroke = Number($('stroke').max);
+  const scale = Math.min(515/radius, 285/(radius + stroke/2)) * (overhead ? 1 : camera.zoom);
+  const sinYaw = overhead ? 0 : Math.sin(camera.yaw);
+  const cosYaw = overhead ? 1 : Math.cos(camera.yaw);
+  const tilt = overhead ? 1 : Math.sin(camera.elevation);
+  const vertical = overhead ? 0 : Math.cos(camera.elevation);
+  const cx = 600, cy = 360 - stroke * scale * vertical / 2;
+  function point(x,y,extension=0) {
+    const across = x*cosYaw - y*sinYaw;
+    const away = x*sinYaw + y*cosYaw;
+    return {x:cx+across*scale, y:cy+(away*tilt+extension*vertical)*scale, depth:away*vertical-extension*tilt};
+  }
+  return {scale,cx,cy,tilt,point};
+}
+function draw() {
+  const {scale,cx,cy,tilt,point} = projection();
+  const rx = radius*scale, ry = Math.max(1,rx*Math.abs(tilt));
+  const bg = ctx.createRadialGradient(600,300,30,600,300,660);
+  bg.addColorStop(0,'#3a5470');bg.addColorStop(1,'#101927');
+  ctx.fillStyle=bg;ctx.fillRect(0,0,1200,720);
+  if (!valid) return;
+
+  ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);
+  ctx.fillStyle=overhead?'#263d54':'rgba(149,191,222,.22)';
+  ctx.fill();
+  ctx.shadowColor='#9cd6ff';ctx.shadowBlur=14;
+  ctx.strokeStyle='#b5e0fb';ctx.lineWidth=2;ctx.stroke();
+  ctx.shadowBlur=0;
+
+  const r = Math.max(.8,diameter*scale/2);
+  const capHeight = Math.max(.6,r*Math.abs(tilt));
+  const rods = points.map(({x,y},index) => {
+    const extension = depthAt(index);
+    return {index, extension, light:lightAt(index,extension), base:point(x,y), tip:point(x,y,extension)};
+  });
+  rods.sort((a,b) => a.base.depth-b.base.depth);
+  for (const {index,extension,light,base,tip} of rods) {
+    if (!overhead && (time <= 0 || time >= duration) && extension <= 0) continue;
+    const height=tip.y-base.y;
+    if (height>.2) {
+      const metal=ctx.createLinearGradient(base.x-r,0,base.x+r,0);
+      metal.addColorStop(0,'#2d3e52');
+      metal.addColorStop(.23,'#7391af');
+      metal.addColorStop(.42,'#e0effa');
+      metal.addColorStop(.57,'#879db5');
+      metal.addColorStop(1,'#344960');
+      ctx.fillStyle=metal;
+      ctx.fillRect(base.x-r,base.y,2*r,height);
+      const lightHeight=Math.min(height,Math.max(2,r*.95));
+      ctx.fillStyle='#405467';
+      ctx.fillRect(tip.x-r,tip.y-lightHeight,2*r,lightHeight);
+      ctx.globalAlpha=light;
+      ctx.fillStyle='#bbddf7';
+      ctx.fillRect(tip.x-r,tip.y-lightHeight,2*r,lightHeight);
+    }
+    ctx.globalAlpha=light;
+    const haloRadius = Math.max(3, r * 2.3);
+    const halo = ctx.createRadialGradient(tip.x,tip.y,0,tip.x,tip.y,haloRadius);
+    halo.addColorStop(0,'rgba(221,241,255,.78)');
+    halo.addColorStop(.44,'rgba(149,209,255,.36)');
+    halo.addColorStop(1,'rgba(114,184,255,0)');
+    ctx.fillStyle=halo;
+    ctx.fillRect(tip.x-haloRadius,tip.y-haloRadius,haloRadius*2,haloRadius*2);
+
+    ctx.globalAlpha=1;
+    ctx.beginPath();ctx.ellipse(tip.x,tip.y,r,capHeight,0,0,Math.PI*2);
+    ctx.fillStyle=overhead && extension<=0?'#647e95':'#425467';ctx.fill();
+    ctx.globalAlpha=index===selected?1:light;
+    ctx.fillStyle=index===selected?'#84ffe1':'#f7fcff';
+    ctx.fill();
+    ctx.globalAlpha=1;
+  }
+  $('clock').textContent = time.toFixed(2)+' / '+duration.toFixed(2)+' 秒';
+  $('time').value=time;
+}
+function stop() {
+  playing=false;
+  cancelAnimationFrame(animationFrame);
+  $('play').textContent='播放';
+}
+function tick(now) {
+  if (!playing) return;
+  time=Math.min(duration,time+(now-last)/1000);
+  last=now;
+  draw();
+  if (time<duration) animationFrame=requestAnimationFrame(tick);
+  else {
+    stop();
+    if (recording && recorder.state==='recording') recorder.stop();
+  }
+}
+function play(fromStart=false) {
+  manual=false;
+  if (fromStart || time>=duration) time=0;
+  playing=true;last=performance.now();$('play').textContent='暂停';
+  draw();animationFrame=requestAnimationFrame(tick);
+}
+function setView(plan) {
+  overhead=plan;
+  $('plan').setAttribute('aria-pressed',plan);
+  $('perspective').setAttribute('aria-pressed',!plan);
+  canvas.style.cursor=plan?'crosshair':'grab';
+  $('viewHelp').textContent=plan?'点击圆柱选中，切回环绕可从侧面观察手动升降。':'拖动画面环绕和俯仰，滚轮缩放。';
+  draw();
+}
+['outer','pitch','rod'].forEach(id => $(id).addEventListener('input',updateGeometry));
+['rate','cap','travel','hold'].forEach(id => $(id).addEventListener('input',()=>updateControls()));
+$('stroke').oninput=()=>updateControls(false);
+$('flicker').oninput=()=>updateControls(false);
+$('manual').oninput=()=>{stop();manual=true;updateControls(false);};
+$('play').onclick=()=>playing?stop():play();
+$('shuffle').onclick=()=>{seed=(seed+1)>>>0;time=0;manual=false;last=performance.now();buildActions();draw();};
+$('duration').onchange=()=>{
+  const input=$('duration');
+  if (!input.validity.valid || !Number.isFinite(value('duration'))) {
+    input.value=duration;
+    $('message').textContent='请输入 1～600 秒。';
+    return;
+  }
+  stop();
+  duration=value('duration');
+  time=Math.min(time,duration);
+  $('time').max=duration;
+  $('record').textContent='录制 '+duration+' 秒视频';
+  $('message').textContent='';
+  buildActions();
+  draw();
+};
+$('time').oninput=()=>{stop();manual=false;time=value('time');draw();};
+$('perspective').onclick=()=>setView(false);
+$('plan').onclick=()=>setView(true);
+$('resetView').onclick=()=>{
+  camera={...homeCamera};
+  setView(false);
+};
+canvas.onpointerdown=e=>{
+  if(overhead || recording || !e.isPrimary || e.button!==0) return;
+  drag={id:e.pointerId,x:e.clientX,y:e.clientY};
+  canvas.setPointerCapture(e.pointerId);
+  canvas.style.cursor='grabbing';
+};
+canvas.onpointermove=e=>{
+  if(drag?.id!==e.pointerId) return;
+  camera.yaw=(camera.yaw+(e.clientX-drag.x)*.009)%(Math.PI*2);
+  camera.elevation=Math.max(-Math.PI/2,Math.min(Math.PI/2,camera.elevation+(e.clientY-drag.y)*.007));
+  drag.x=e.clientX;
+  drag.y=e.clientY;
+  draw();
+};
+canvas.onlostpointercapture=()=>{
+  drag=null;
+  canvas.style.cursor=overhead?'crosshair':'grab';
+};
+canvas.addEventListener('wheel',e=>{
+  if(overhead || recording) return;
+  e.preventDefault();
+  const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?240:1);
+  camera.zoom=Math.max(.55,Math.min(3,camera.zoom*Math.exp(-delta*.0015)));
+  draw();
+},{passive:false});
+canvas.onclick=e=>{
+  if (!overhead || recording) return;
+  const rect=canvas.getBoundingClientRect();
+  const {scale,cx,cy}=projection();
+  const x=((e.clientX-rect.left)*1200/rect.width-cx)/scale;
+  const y=((e.clientY-rect.top)*720/rect.height-cy)/scale;
+  selected=points.findIndex(p=>Math.hypot(p.x-x,p.y-y)<=diameter/2);
+  draw();
+};
+let recorder;
+$('record').onclick=()=>{
+  if (recording || !valid) return;
+  if (!canvas.captureStream || !window.MediaRecorder) {
+    $('message').textContent='此浏览器不支持录制，请用 Chrome 或 Edge 打开。';return;
+  }
+  stop();
+  const stream=canvas.captureStream(30);
+  try { recorder=new MediaRecorder(stream); }
+  catch {stream.getTracks().forEach(t=>t.stop());$('message').textContent='录制启动失败。';return;}
+  const chunks=[];
+  const controls=[...document.querySelectorAll('input,button')];
+  const states=controls.map(control=>control.disabled);
+  controls.forEach(control=>control.disabled=true);
+  recording=true;
+  $('message').textContent='正在录制，请保持页面可见。';
+  recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+  recorder.onstop=()=>{
+    stream.getTracks().forEach(t=>t.stop());
+    recording=false;
+    controls.forEach((control,i)=>control.disabled=states[i]);
+    if (!chunks.length) {$('message').textContent='没有录到画面，请重试。';return;}
+    const type=recorder.mimeType || chunks[0].type;
+    const url=URL.createObjectURL(new Blob(chunks,{type}));
+    const link=document.createElement('a');
+    link.href=url;link.download='杆阵演示.'+(type.includes('mp4')?'mp4':'webm');link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),30000);
+    $('message').textContent='视频已生成。';
+  };
+  recorder.onerror=()=>{
+    stop();
+    if(recorder.state!=='inactive') recorder.stop();
+  };
+  recorder.start();
+  play(true);
+};
+updateControls();
+updateGeometry();
+setView(false);
+</script>
+</html>
